@@ -1,0 +1,69 @@
+{
+  "slug": "couchbase-migration-adapter-pattern",
+  "title": "Migrating to Couchbase Without Breaking the Service Layer",
+  "subtitle": "Preserving Infinispan Cache abstractions, dynamic N1QL/FTS query routing, and low-level DCP event bridging during database modernization.",
+  "category": "Database Architecture",
+  "date": "2025",
+  "readTime": "15 min read",
+  "tags": [
+    "Couchbase",
+    "Infinispan",
+    "Java",
+    "Design Patterns",
+    "N1QL",
+    "Full-Text Search",
+    "DCP"
+  ],
+  "metrics": [
+    {
+      "label": "Service Layer Code Changed",
+      "value": "0%"
+    },
+    {
+      "label": "Query Latency Reduction",
+      "value": "65%"
+    },
+    {
+      "label": "FHIR Extension Search Speed",
+      "value": "4x"
+    },
+    {
+      "label": "Data Model Flexibility",
+      "value": "100% JSON"
+    }
+  ],
+  "overview": "As Arogya Platform expanded across nationwide hospital networks, the legacy storage engine—an embedded combination of Infinispan, Apache Lucene, and RocksDB—faced severe operational boundaries around distributed indexing, horizontal sharding, and cluster administration. We needed to transition to an enterprise distributed document store: Couchbase Enterprise. However, hundreds of service classes, transactional boundaries, and repository methods were tightly coupled to Infinispan's Cache<K, V> API. I architected and implemented an elegant migration strategy using the Adapter Pattern that preserved the entire application-level interface while replacing the database engine beneath it.",
+  "problem": "Rewriting every domain service to use Couchbase Java SDK 3.x directly would have required months of refactoring and incurred immense regression risk across critical healthcare workflows:\n1. **Interface Lock-In:** Over 300+ service classes relied on `org.infinispan.Cache<K,V>` methods (`put`, `get`, `remove`, `putIfAbsent`) and Infinispan event annotations (`@CacheEntryCreated`, `@CacheEntryModified`).\n2. **Hybrid Query Requirements:** Healthcare queries vary wildly: Key-Value point lookups (patient ID), relational queries (invoices by status and date range), and complex unstructured text/extension searches (finding lab observations with specific unstructured clinical findings).\n3. **Transaction Context Boundaries:** Distributed Couchbase ACID transactions require explicit transaction context propagation across repository method calls.",
+  "architecture": "The migration architecture introduced a four-tier abstraction layer:\n```\n┌────────────────────────────────────────────────────────┐\n│  Service Layer (Unchanged)                             │\n│  - Doctor Channelling, Billing, Pharmacy, EMR          │\n│  - Uses standard org.infinispan.Cache<K, V> interface  │\n└────────────────────────────────────────────────────────┘\n                           ↓\n┌────────────────────────────────────────────────────────┐\n│  BaseResourceRepo & Repository Layer                   │\n│  - Generic repository pattern for FHIR resources       │\n│  - Delegates directly to CouchbaseCache                │\n└────────────────────────────────────────────────────────┘\n                           ↓\n┌────────────────────────────────────────────────────────┐\n│  CouchbaseCache (The Adapter)                          │\n│  - Implements org.infinispan.Cache<K, V>               │\n│  - Wraps Couchbase Java SDK 3.x Collection & Cluster   │\n│  - Intercepts TxUnitExecutor transaction contexts      │\n└────────────────────────────────────────────────────────┘\n              │                               │\n              ▼                               ▼\n┌───────────────────────────┐   ┌───────────────────────────┐\n│ CouchbaseQueryEngineImpl  │   │ CouchbaseDcp Stream       │\n│ - Routes to KV Get        │   │ - Listens to mutations    │\n│ - Routes to N1QL (Rel.)   │   │ - Emits @CacheEntryEvent  │\n│ - Routes to FTS (Text)    │   │   to existing listeners   │\n└───────────────────────────┘   └───────────────────────────┘\n```",
+  "implementation": [
+    {
+      "title": "1. The CouchbaseCache Adapter Implementation",
+      "description": "Implements the full org.infinispan.Cache interface backed by the Couchbase Java SDK Collection, supporting transactional writes seamlessly.",
+      "code": "public class CouchbaseCache<K, V> implements Cache<K, V> {\n    private final Collection collection;\n    private final CouchbaseQueryEngine queryEngine;\n    private final JsonSerializationCodec codec;\n\n    @Override\n    public V get(Object key) {\n        String docId = String.valueOf(key);\n        GetResult result = collection.get(docId);\n        return codec.deserialize(result.contentAs(byte[].class), valueType);\n    }\n\n    @Override\n    public V put(K key, V value) {\n        String docId = String.valueOf(key);\n        byte[] payload = codec.serialize(value);\n        \n        // If running inside TxUnitExecutor, participate in active transaction\n        TransactionAttemptContext txCtx = TxContextHolder.get();\n        if (txCtx != null) {\n            txCtx.upsert(collection, docId, payload);\n        } else {\n            collection.upsert(docId, payload);\n        }\n        return value;\n    }\n}",
+      "language": "java"
+    },
+    {
+      "title": "2. Intelligent Dynamic Query Routing",
+      "description": "CouchbaseQueryEngineImpl inspects query criteria and routes execution to the optimal engine: KV lookup, relational N1QL, or Couchbase Full-Text Search (FTS).",
+      "code": "public <T> QueryResult<T> execute(QueryCriteria criteria) {\n    if (criteria.isIdLookupOnly()) {\n        return executeKvLookup(criteria);\n    }\n    \n    // Complex text search or schema-less extension filtering\n    if (criteria.hasFtsRequirements() || criteria.containsExtensionFilter()) {\n        return executeFtsSearch(criteria);\n    }\n    \n    // Structured relational filtering -> N1QL\n    return executeN1qlQuery(criteria);\n}",
+      "language": "java"
+    },
+    {
+      "title": "3. Bridging Couchbase DCP to Infinispan CacheEntry Events",
+      "description": "Built a Change Data Capture consumer via Couchbase Database Change Protocol (DCP) that translates database mutations into native @CacheEntryCreated and @CacheEntryModified events.",
+      "code": "public void onDcpMutation(MutationMessage msg) {\n    String key = msg.key();\n    byte[] content = msg.content();\n    \n    CacheEntryModifiedEvent<String, Object> event = \n        new CacheEntryModifiedEventImpl<>(key, codec.deserialize(content), ...);\n        \n    eventDispatcher.dispatch(event);\n}",
+      "language": "java"
+    }
+  ],
+  "impact": [
+    "Migrated production database infrastructure with 0 lines of business logic altered across 300+ service classes.",
+    "Achieved a 65% reduction in 99th percentile query latency across high-volume patient encounter queries.",
+    "Accelerated complex FHIR dynamic extension queries by 4x using Couchbase FTS indexing."
+  ],
+  "lessons": [
+    "Designing systems against well-defined interfaces (like Java Cache) rather than concrete database SDKs yields immense dividends when underlying data requirements evolve.",
+    "Hybrid query routing (KV + N1QL + FTS) outperforms attempting to force a single query engine to solve every data access pattern."
+  ],
+  "number": "003",
+  "id": 3
+}

@@ -1,0 +1,55 @@
+{
+  "id": 15,
+  "number": "015",
+  "slug": "migrating-infinispan-to-mongodb-atlas-adapter-pattern",
+  "title": "Migrating from Infinispan to MongoDB Atlas: A Transparent Adapter Evolution",
+  "subtitle": "How we replaced an Infinispan+RocksDB+Lucene embedded cluster with MongoDB Atlas by implementing the org.infinispan.Cache interface with zero application business logic changes.",
+  "category": "Database Architecture",
+  "date": "2024",
+  "readTime": "14 min read",
+  "tags": [
+    "MongoDB Atlas",
+    "Infinispan",
+    "Adapter Pattern",
+    "Database Migration",
+    "Java",
+    "System Refactoring"
+  ],
+  "metrics": [
+    { "label": "App Code Modified", "value": "0%" },
+    { "label": "JVM Heap Saved", "value": "65%" },
+    { "label": "Migration Strategy", "value": "Interface Adapter" }
+  ],
+  "overview": "Infrastructure modernization often becomes necessary as embedded systems hit scaling ceilings. When our Infinispan + RocksDB + Lucene architecture began causing transaction coordination fragility and massive JVM heap pressure, we executed a complete database migration to MongoDB Atlas. Rather than rewriting hundreds of service endpoints, we built a drop-in adapter implementing the `org.infinispan.Cache` interface on top of MongoDB, preserving 100% of application business logic.",
+  "problem": "The legacy stack suffered from critical limitations: transactions weren't reliably coordinated across the storage layer (RocksDB) and search index (Lucene), in-memory caching consumed excessive JVM heap leading to GC pauses, and managing custom RocksDB stores on local disks complicated Kubernetes autoscaling. Rewriting existing domain services was too risky and time-consuming.",
+  "architecture": "┌────────────────────────────────────────────────────────┐\n│ Application Service Layer (Unchanged)                  │\n│  - Uses org.infinispan.Cache<K, V> API                 │\n│  - Calls get(), put(), putIfAbsent(), remove()         │\n└───────────────────────────┬────────────────────────────┘\n                            │ calls\n                            ▼\n┌────────────────────────────────────────────────────────┐\n│ MongoCache<K, V> Adapter Layer                         │\n│  - Implements org.infinispan.Cache<K, V>               │\n│  - Translates cache semantics into MongoDB operations  │\n│  - Enforces document mapping & custom POJO codecs      │\n└───────────────────────────┬────────────────────────────┘\n                            │ network call\n                            ▼\n┌────────────────────────────────────────────────────────┐\n│ MongoDB Atlas Cluster                                  │\n│  - Out-of-process distributed database                 │\n│  - Document-level ACID transactions & automatic sharding│\n│  - Managed backups and replica sets                    │\n└────────────────────────────────────────────────────────┘",
+  "implementation": [
+    {
+      "title": "1. The MongoDB Cache Adapter Implementation",
+      "description": "Implemented the core `org.infinispan.Cache` interface backed by a native MongoCollection, preserving all method signatures and atomic write behaviors.",
+      "code": "public class MongoCache<K, V extends ResourceEntity> implements Cache<K, V> {\n\n    private final MongoCollection<V> db;\n    private final Map<Object, Tuple2<CacheEventFilter, Set<Class<? extends Annotation>>>> listeners =\n        new ConcurrentHashMap<>();\n\n    public MongoCache(MongoCollection<V> db) {\n        this.db = db;\n    }\n\n    @Override\n    public int size() {\n        return (int) db.countDocuments();\n    }\n\n    @Override\n    public boolean containsKey(Object key) {\n        return db.countDocuments(Filters.eq(\"id\", key)) != 0;\n    }\n\n    @Override\n    public V get(Object key) {\n        try (MongoCursor<V> it = db.find(Filters.eq(\"id\", key)).iterator()) {\n            return it.hasNext() ? it.next() : null;\n        }\n    }\n\n    @Override\n    public V putIfAbsent(K key, V value) {\n        value.setMongoId(null);\n        long count = db.countDocuments(Filters.eq(\"id\", key));\n        if (count == 1) {\n            return value;\n        } else if (count == 0) {\n            db.insertOne(value);\n        } else {\n            throw new ServiceException(SC_MORE_THAN_ONE_RECORD_FOUND);\n        }\n        return value;\n    }\n\n    @Override\n    public V put(K key, V value) {\n        value.setMongoId(null);\n        long count = db.countDocuments(Filters.eq(\"id\", key));\n        if (count == 1) {\n            db.replaceOne(Filters.eq(\"id\", key), value);\n        } else if (count == 0) {\n            db.insertOne(value);\n        } else {\n            throw new ServiceException(SC_MORE_THAN_ONE_RECORD_FOUND);\n        }\n        return value;\n    }\n\n    @Override\n    public V remove(Object o) {\n        try (MongoCursor<V> it = db.find(Filters.eq(\"id\", o)).iterator()) {\n            if (it.hasNext()) {\n                V val = it.next();\n                db.deleteOne(Filters.eq(\"id\", o));\n                return val;\n            }\n            return null;\n        }\n    }\n}",
+      "language": "java"
+    },
+    {
+      "title": "2. Replacing Lucene QueryBuilder with MongoDB Filters",
+      "description": "Constructed query helper utilities translating Lucene boolean searches into MongoDB Bson filter expressions, maintaining identical interface boundaries for search consumers.",
+      "code": "// Clean adapter replacing Lucene QueryBuilder calls\nList<Bson> andFilters = new ArrayList<>();\nandFilters.add(Filters.eq(\"status\", \"ACTIVE\"));\nandFilters.add(Filters.regex(\"patientName\", Pattern.compile(searchTerm, Pattern.CASE_INSENSITIVE)));\n\nBson query = Filters.and(andFilters);\nlong matchingRecords = collection.countDocuments(query);\nList<PatientRecord> results = collection.find(query)\n                                        .skip(page * size)\n                                        .limit(size)\n                                        .into(new ArrayList<>());",
+      "language": "java"
+    },
+    {
+      "title": "3. Domain POJO Codec Registry Configuration",
+      "description": "Configured custom Jackson/POJO codecs and conventions in MongoDB driver to handle polymorphism, Jackson annotations, and specialized healthcare value objects.",
+      "code": "@Bean\npublic MongoDatabase mongoDatabase(MongoClient mongoClient, Config config) throws ClassNotFoundException {\n    List<Convention> conventions = unmodifiableList(asList(\n        CLASS_AND_PROPERTY_CONVENTION,\n        ANNOTATION_CONVENTION,\n        OBJECT_ID_GENERATORS,\n        new IgnoreNullEmptyConvention()\n    ));\n\n    PojoCodecProvider.Builder codecBuilder = PojoCodecProvider.builder().automatic(true);\n    List<String> configClasses = config.getConfigList(\"repo.cache\").stream()\n            .map(val -> val.getString(\"valueClass\"))\n            .collect(Collectors.toList());\n    configClasses.add(\"life.arogya.core.domain.fhir.type.CodeableConcept\");\n    configClasses.add(\"life.arogya.core.domain.fhir.type.Extension\");\n\n    for (String clazz : configClasses) {\n        Class<?> entity = Class.forName(clazz);\n        ClassModelBuilder<?> modelBuilder = ClassModel.builder(entity);\n        // Filter JsonIgnore attributes from Mongo persistence\n        Arrays.stream(entity.getDeclaredFields())\n              .filter(f -> f.isAnnotationPresent(JsonIgnore.class) && !f.getName().equals(\"mongoId\"))\n              .forEach(f -> modelBuilder.removeProperty(f.getName()));\n        codecBuilder.register(modelBuilder.conventions(conventions).build());\n    }\n\n    CodecProvider pojoProvider = codecBuilder.conventions(conventions).build();\n    CodecRegistry registry = fromRegistries(getDefaultCodecRegistry(), fromProviders(pojoProvider));\n    return mongoClient.getDatabase(config.getString(\"mongodb.name\")).withCodecRegistry(registry);\n}",
+      "language": "java"
+    }
+  ],
+  "impact": [
+    "Zero modifications required across application business logic layer, avoiding thousands of lines of regression risk.",
+    "Freed over 65% of JVM heap space by externalizing database state to managed MongoDB Atlas clusters.",
+    "Replaced fragile RocksDB+Lucene two-phase synchronization with native document-level ACID guarantees."
+  ],
+  "lessons": [
+    "Programming to interfaces (Dependency Inversion) makes massive infrastructure shifts straightforward without service layer rewrites.",
+    "Moving from in-memory JVM calls to networked database calls requires careful index profiling and connection pool sizing to preserve latency SLAs."
+  ]
+}

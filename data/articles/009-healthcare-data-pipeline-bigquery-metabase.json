@@ -1,0 +1,63 @@
+{
+  "slug": "healthcare-data-pipeline-bigquery-metabase",
+  "title": "Cloud-Native Analytics Pipeline from Hospital Core to Google BigQuery",
+  "subtitle": "Automating multi-cloud data extraction, partitioned BigQuery data warehousing, and self-hosted Metabase BI dashboards for clinical executives.",
+  "category": "Data Engineering",
+  "date": "2025",
+  "readTime": "13 min read",
+  "tags": [
+    "Google BigQuery",
+    "Data Pipelines",
+    "Metabase",
+    "Docker",
+    "Apache jclouds",
+    "Ansible",
+    "ETL"
+  ],
+  "metrics": [
+    {
+      "label": "Query Performance",
+      "value": "10x faster BI"
+    },
+    {
+      "label": "Data Warehouse",
+      "value": "Google BigQuery"
+    },
+    {
+      "label": "Operational Impact",
+      "value": "0% OLTP Load"
+    },
+    {
+      "label": "Dashboard Stack",
+      "value": "Dockerized Metabase"
+    }
+  ],
+  "overview": "Hospital leadership requires strategic operational insights: department-wise bed occupancy rates, revenue trends by clinical specialization, average patient wait times, and high-cost medication turnover. However, executing multi-table analytical aggregations against the live operational HMS database risked degrading clinical performance. In 2025, I designed and automated Arogya's modern data analytics pipeline: scheduled cloud data extraction, automated ingest into Google Cloud BigQuery, and provisioning self-hosted Metabase BI dashboards via Ansible.",
+  "problem": "Healthcare analytical pipelines face unique constraints:\n1. **Zero Impact on Production Transactional DB:** Doctors charting vital signs and phlebotomists posting blood test results cannot experience database slowness caused by an administrator generating a 12-month revenue report.\n2. **Multi-Cloud Data Movement:** The primary HMS operates on Microsoft Azure, while BigQuery analytics reside on Google Cloud Platform. Data transfer must be automated, compressed, encrypted, and resilient to transient network drops.\n3. **Automated Infrastructure Deployment:** Hospital operations teams do not maintain complex Kubernetes analytical clusters; the BI visualization layer needed to deploy as a lightweight, containerized Metabase instance automated via Ansible.",
+  "architecture": "The analytics architecture decouples extraction, warehousing, and visualization:\n```\n┌───────────────────────────────────────┐\n│  Primary HMS Database (Azure Cloud)   │\n│  - Invoices, Encounters, Pharmacy     │\n└───────────────────┬───────────────────┘\n                    │ Scheduled Off-Peak Batch Export\n                    ▼\n┌────────────────────────────────────────────────────────┐\n│  Arogya Data Pipeline (Java + Apache jclouds)          │\n│  ├─ Normalizes clinical & financial transaction data   │\n│  ├─ Generates compressed CSV data partitions           │\n│  └─ Streams securely to Google Cloud Storage (GCS)     │\n└───────────────────┬────────────────────────────────────┘\n                    │ GCS Cloud Storage Trigger\n                    ▼\n┌────────────────────────────────────────────────────────┐\n│  Google Cloud BigQuery                                 │\n│  ├─ Partitioned & Clustered Analytical Datasets        │\n│  ├─ Optimized SQL Views (Daily Revenue, Turnaround)    │\n│  └─ High-performance serverless SQL execution          │\n└───────────────────┬────────────────────────────────────┘\n                    │ Fast SQL Queries\n                    ▼\n┌────────────────────────────────────────────────────────┐\n│  Containerized Metabase BI (Deployed via Ansible)      │\n│  - Executive KPI Dashboards, Bed Occupancy Charts      │\n│  - Hospital Administrative Reporting                   │\n└────────────────────────────────────────────────────────┘\n```",
+  "implementation": [
+    {
+      "title": "1. Multi-Cloud Data Export via Apache jclouds",
+      "description": "Automates extraction, formatting, and secure streaming of normalized transactional data directly into Google Cloud Storage buckets.",
+      "code": "public void uploadAnalyticsData(File csvData, String destinationPath) {\n    BlobStoreContext context = ContextBuilder.newBuilder(\"google-cloud-storage\")\n        .credentials(serviceAccountEmail, privateKeyPem)\n        .buildView(BlobStoreContext.class);\n\n    BlobStore blobStore = context.getBlobStore();\n    Blob blob = blobStore.blobBuilder(destinationPath)\n        .payload(Files.asByteSource(csvData))\n        .contentType(\"text/csv\")\n        .contentEncoding(\"gzip\")\n        .build();\n\n    blobStore.putBlob(bucketName, blob);\n    context.close();\n}",
+      "language": "java"
+    },
+    {
+      "title": "2. Ansible Playbook for Dockerized Metabase Deployment",
+      "description": "Automates provisioning of Docker runtime, Google Cloud credentials, and containerized Metabase dashboards connected to BigQuery.",
+      "code": "- name: Deploy Dockerized Metabase Analytics Dashboard\n  hosts: analytics_servers\n  tasks:\n    - name: Ensure Docker service is running\n      systemd:\n        name: docker\n        state: started\n\n    - name: Deploy Metabase container\n      docker_container:\n        name: arogya-metabase\n        image: metabase/metabase:v0.42.0\n        state: started\n        restart_policy: always\n        published_ports:\n          - \"3000:3000\"\n        volumes:\n          - /etc/arogya/gcp-credentials.json:/etc/gcp-credentials.json:ro\n          - /var/lib/metabase:/metabase-data\n        env:\n          MB_DB_FILE: /metabase-data/metabase.db",
+      "language": "yaml"
+    }
+  ],
+  "impact": [
+    "Accelerated hospital executive analytical reports from minutes of slow database querying to sub-second BigQuery executions.",
+    "Achieved 100% operational isolation: zero performance degradation on primary hospital transaction systems during report generation.",
+    "Enabled hospital clinical leadership to visualize patient turnaround times and pharmacy turnover through live Metabase dashboards."
+  ],
+  "lessons": [
+    "Transactional OLTP engines and analytical OLAP engines serve fundamentally different access patterns; attempting to run complex aggregations on transactional stores is an anti-pattern.",
+    "Leveraging serverless cloud warehouses (BigQuery) paired with lightweight self-hosted visualization tools (Metabase) provides enterprise BI capabilities at a fraction of enterprise SaaS costs."
+  ],
+  "number": "009",
+  "id": 9
+}

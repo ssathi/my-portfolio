@@ -1,0 +1,61 @@
+{
+  "id": 12,
+  "number": "012",
+  "slug": "building-delta-lake-azure-synapse-analytics",
+  "title": "Building a Delta Lake with Azure Synapse Analytics",
+  "subtitle": "Implementing an end-to-end ACID lakehouse pipeline on ADLS Gen2 converting raw batch streams to Parquet with deduplication and SQL external tables.",
+  "category": "Data Engineering",
+  "date": "2024",
+  "readTime": "11 min read",
+  "tags": [
+    "Delta Lake",
+    "Azure Synapse",
+    "ADLS Gen2",
+    "Apache Parquet",
+    "Lakehouse",
+    "ETL Data Flow"
+  ],
+  "metrics": [
+    { "label": "Storage Engine", "value": "Delta Lake" },
+    { "label": "Format", "value": "Parquet + ACID" },
+    { "label": "Pipeline Tool", "value": "Synapse Studio" }
+  ],
+  "overview": "Modern organizations require unified architectures to handle massive analytical ingest without compromising data integrity or concurrency. Delta Lake introduces an open-source storage abstraction that brings ACID transactional semantics, metadata scalability, and time travel to object stores. This technical guide documents our end-to-end implementation in Azure Synapse Analytics, transforming raw CSV inputs into an enterprise-ready Delta Lake with external SQL tables.",
+  "problem": "Handling streaming and batch file uploads directly on cloud blob storage exposes analytics pipelines to partial reads, schema drifts, and duplicate transactions. Traditional raw data lakes lack transactional isolation: concurrent writes can leave tables in inconsistent states, and query engines frequently struggle with partition pruning when dealing with large volumes of small uncompressed CSV files.",
+  "architecture": "┌──────────────────┐     ┌─────────────────────────────────────────────────────────┐\n│ Raw Ingestion    │     │ Azure Synapse Analytics Workspace                       │\n│ (ADLS Gen2)      │     │                                                         │\n│                  │     │  ┌──────────────┐     ┌──────────────┐    ┌──────────┐  │\n│  Input CSV Files ├────►│  │ Source Block │────►│ AlterRow     ├───►│ Sink     │  │\n│  (Wildcard match)│     │  │ (Schema Map) │     │ (Deduplicate)│    │ (Delta)  │  │\n└──────────────────┘     │  └──────────────┘     └──────────────┘    └────┬─────┘  │\n                         └────────────────────────────────────────────────┼────────┘\n                                                                          ▼\n┌─────────────────────────────────────────────────────────────────────────────────┐\n│ Analytical Lakehouse Layer                                                      │\n│  - Delta Table Transaction Log (_delta_log)                                     │\n│  - Columnar Parquet Partitions with Flattened Hierarchy                         │\n│  - Synapse Serverless SQL External Tables for Metabase & BI Queries             │\n└─────────────────────────────────────────────────────────────────────────────────┘",
+  "implementation": [
+    {
+      "title": "1. ADLS Gen2 Storage Hierarchy Setup",
+      "description": "Established segregated storage directories separating ingestion from analytical surfaces. Raw landing zones receive untrusted batch CSV files, while the analytical output container hosts Parquet files governed by Delta transaction logs.",
+      "code": "# Storage Architecture Structure\n# adls-gen2://arogyaanalytics-default/\n#   ├── raw-input/\n#   │   └── appointments/*.csv\n#   └── lakehouse-output/\n#       └── appointments_delta/\n#           ├── _delta_log/\n#           └── part-*.parquet",
+      "language": "text"
+    },
+    {
+      "title": "2. Data Flow Design: Ingestion, Transformation & Deduplication",
+      "description": "Constructed an automated Synapse Studio Data Flow using three core stages: Source (reading raw CSVs with wildcard path matching), AlterRow (applying data hygiene rules and primary key deduplication), and Sink (writing Delta Lake files).",
+      "code": "/* Synapse Data Flow Script Representation */\nsource(output(\n    appointmentId as string,\n    patientId as string,\n    doctorCode as string,\n    sessionTimestamp as timestamp,\n    feeAmount as decimal(18,2)\n  ),\n  allowSchemaDrift: true,\n  validateSchema: false,\n  wildcardPaths: ['appointments/*.csv']) ~> sourceCSV\n\nsourceCSV alterRow(\n  upsertIf(true()) // Enforces idempotent write semantics during merge\n) ~> AlterRowDeduplicate\n\nAlterRowDeduplicate sink(allowSchemaDrift: true,\n  validateSchema: false,\n  format: 'delta',\n  compressionType: 'snappy',\n  vacuum: 0,\n  deletable: false,\n  insertable: true,\n  updateable: false,\n  upsertable: true,\n  keys: ['appointmentId'],\n  skipDuplicateMapInputs: true,\n  skipDuplicateMapOutputs: true) ~> sinkDelta",
+      "language": "sql"
+    },
+    {
+      "title": "3. Sink Optimization and Performance Tuning",
+      "description": "Configured the Delta sink for columnar writes with snappy compression, enabled 'Optimize Write' to reduce small-file fragmentation, and set copy behavior to 'Flatten hierarchy' for standard lakehouse directory layouts.",
+      "code": "-- Optimization settings configured in Synapse pipeline:\n-- Optimize Write: Enabled (auto-compacts small batches into target ~128MB Parquet files)\n-- Format: Delta (Snappy compression)\n-- Hierarchy: Flattened structure for efficient partition pruning",
+      "language": "text"
+    },
+    {
+      "title": "4. External Table Creation for Serverless SQL Analytics",
+      "description": "Exposed the underlying Delta files through Synapse Serverless SQL Pools using external tables, allowing reporting tools and BI dashboards to execute ANSI SQL queries directly against the lakehouse.",
+      "code": "CREATE EXTERNAL TABLE analytics.appointments_delta (\n    appointmentId VARCHAR(64),\n    patientId VARCHAR(64),\n    doctorCode VARCHAR(32),\n    sessionTimestamp DATETIME2,\n    feeAmount DECIMAL(18,2)\n)\nWITH (\n    LOCATION = 'lakehouse-output/appointments_delta/',\n    DATA_SOURCE = SynapseDeltaDataSource,\n    FILE_FORMAT = DeltaFileFormat\n);",
+      "language": "sql"
+    }
+  ],
+  "impact": [
+    "Eliminated data corruption from concurrent batch writes via Delta Lake ACID transaction guarantees.",
+    "Drastically accelerated analytical query speeds by moving from row-oriented uncompressed CSV to columnar Snappy-compressed Parquet.",
+    "Enabled BI dashboards to run real-time ANSI SQL queries via Synapse Serverless SQL external tables without spinning up dedicated data warehouses."
+  ],
+  "lessons": [
+    "Always enable 'Optimize Write' in Synapse Data Flows to prevent the classic small-file problem when streaming or micro-batching into Delta sinks.",
+    "Configure fine-grained RBAC on ADLS Gen2 storage accounts: separate ingest identity credentials from analytical query engine service principals."
+  ]
+}

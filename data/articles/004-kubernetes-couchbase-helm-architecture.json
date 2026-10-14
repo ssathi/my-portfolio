@@ -1,0 +1,75 @@
+{
+  "slug": "kubernetes-couchbase-helm-architecture",
+  "title": "Production Couchbase on Kubernetes: Custom Helm Chart, StatefulSets & FTS Tuning",
+  "subtitle": "Bootstrapping enterprise Couchbase clusters with automated cluster-init lifecycle hooks, headless DNS discovery, and Bleve FTS memory quotas on Google Kubernetes Engine (GKE).",
+  "category": "DevOps & Systems",
+  "date": "2026",
+  "readTime": "14 min read",
+  "tags": [
+    "Kubernetes",
+    "Helm",
+    "Couchbase Enterprise",
+    "StatefulSet",
+    "GKE",
+    "FTS Bleve",
+    "Database on K8s"
+  ],
+  "metrics": [
+    {
+      "label": "Chart Location",
+      "value": "couchbase-helm"
+    },
+    {
+      "label": "Node Sizing",
+      "value": "e2-highmem-8 (64 GB)"
+    },
+    {
+      "label": "FTS Memory Allocation",
+      "value": "24 GB (32,768 MB)"
+    },
+    {
+      "label": "SSD StorageClass",
+      "value": "128 Gi High-IOPS"
+    }
+  ],
+  "overview": "Deploying enterprise distributed databases inside Kubernetes is notoriously complex: stateful workloads demand deterministic network identities, persistent high-IOPS storage, and zero-downtime cluster rebalancing. In arogya-ops/couchbase-helm, I engineered a production Helm chart deploying Couchbase Enterprise 7.6.x on Google Kubernetes Engine (GKE). The chart manages Kubernetes StatefulSets, headless discovery services, automated postStart cluster initialization, and fine-grained multi-dimensional service memory quotas tailored for heavy healthcare Full-Text Search (FTS).",
+  "problem": "Running Couchbase Enterprise inside Kubernetes presented critical infrastructure challenges:\n1. **Automated Seed Bootstrapping vs Rebalance:** When scaling a StatefulSet, the seed pod (`couchbase-ce-cluster-0`) must run `couchbase-cli cluster-init`, whereas replica pods must discover the seed via headless FQDNs, execute `server-add`, and trigger rebalance without split-brain conditions.\n2. **Search Memory Starvation & Bleve Clause Limits:** Healthcare clinical searches across unstructured FHIR records resulted in: `Unknown search error: \"rest_index: Query, indexName: Location, err: pindex not available\"`. The underlying Bleve search engine exhausted memory under complex clause expansions.\n3. **Zero-Downtime Node Pool Migrations:** Upgrading underlying Kubernetes hardware from `e2-standard-8` to `e2-highmem-8` required strict cordon, drain, and node pool replacement workflows without interrupting ongoing hospital database transactions.",
+  "architecture": "The Helm StatefulSet and headless discovery topology on Google Kubernetes Engine (GKE):\n```\nKubernetes StatefulSet: couchbase-ce-cluster (Namespace: default)\n  ├── Headless Service: couchbase-ce-cluster (ClusterIP: None)\n  │     Provides stable DNS: couchbase-ce-cluster-{0,1}.couchbase-ce-cluster.svc.cluster.local\n  │\n  ├── Pod 0 (Seed Node): couchbase-ce-cluster-0\n  │     ├─ VolumeMount: 128Gi SSD PersistentVolumeClaim (pd-ssd)\n  │     ├─ postStart Hook: Detects seed -> executes cluster-init (Data, Index, Query, FTS)\n  │     └─ Service Memory Quotas: FTS (24GB), Data (16GB), Index (3GB), Query (2GB)\n  │\n  ├── Pod 1..N (Replica Nodes): couchbase-ce-cluster-1\n  │     ├─ postStart Hook: Discovers Seed via Pod FQDN -> server-add -> rebalance\n  │     └─ Sets alternate-address for external Ingress / VPN routing\n  │\n  └── Ingress & TLS: hemas-db-tbd3.arogya.cloud (OpenResty / Cert-Manager)\n```",
+  "implementation": [
+    {
+      "title": "1. Automated Cluster Initialization & Joining Lifecycle Hook",
+      "description": "Embedded inside statefulset.yaml, this postStart lifecycle script distinguishes between seed node initialization and replica node joining.",
+      "code": "lifecycle:\n  postStart:\n    exec:\n      command:\n        - /bin/sh\n        - -c\n        - |\n          set -e\n          HOSTNAME=$(hostname)\n          POD_FQDN=\"${HOSTNAME}.${CLUSTER_NAME}.${NAMESPACE}.svc.cluster.local\"\n          SEED_NODE=\"${CLUSTER_NAME}-0.${CLUSTER_NAME}.${NAMESPACE}.svc.cluster.local\"\n\n          until curl -sk https://127.0.0.1:18091/pools >/dev/null 2>&1; do sleep 5; done\n\n          if [ \"$HOSTNAME\" = \"${CLUSTER_NAME}-0\" ]; then\n            if couchbase-cli server-list -c 127.0.0.1 -u $ADMIN_USER -p $ADMIN_PASS >/dev/null 2>&1; then\n              exit 0\n            fi\n            couchbase-cli cluster-init \\\n              --cluster-username $ADMIN_USER --cluster-password $ADMIN_PASS \\\n              --services data,index,query,fts \\\n              --cluster-ramsize 16384 --cluster-index-ramsize 3072 --cluster-fts-ramsize 24576\n          else\n            couchbase-cli server-add \\\n              --cluster $SEED_NODE -u $ADMIN_USER -p $ADMIN_PASS \\\n              --server-add $POD_FQDN --server-add-username $ADMIN_USER --server-add-password $ADMIN_PASS \\\n              --services data,index,query,fts\n            couchbase-cli rebalance --cluster $SEED_NODE -u $ADMIN_USER -p $ADMIN_PASS\n          fi",
+      "language": "yaml"
+    },
+    {
+      "title": "2. Multi-Dimensional Service Memory Budgeting (64 GB Node Sizing)",
+      "description": "Tuned memory quotas across multi-dimensional services, allocating the largest share (24 GB) to Full-Text Search (FTS) to handle clinical unstructured FHIR queries.",
+      "code": "# Memory distribution for e2-highmem-8 (64 GB RAM)\n# -------------------------------------------------------------\n# Service          Allocation      Why\n# -------------------------------------------------------------\n# Search (FTS)     24 GB (32768MB) Primary workload; large index working set\n# Data (KV)        16 GB (14336MB) Document working-set caching\n# Index (GSI)       3 GB  (3072MB) Global Secondary Indexes headroom\n# Query (N1QL)      2 GB  (2048MB) Concurrent query memory\n# OS & System       7 GB           Leaves buffer for kernel & JVM\n# Total            45 GB allocated out of 52Gi container request",
+      "language": "text"
+    },
+    {
+      "title": "3. Tuning Bleve Search Engine Max Clause Limits",
+      "description": "Eliminates \"pindex not available\" errors during complex medical searches by raising the Bleve FTS clause threshold via Couchbase REST API.",
+      "code": "# Tune Bleve clause expansion limit for complex medical searches\ncurl -X PUT -H \"Content-Type: application/json\" \\\n  -u $COUCHBASE_ADMIN_USER:$COUCHBASE_ADMIN_PASSWORD \\\n  http://couchbase-fts:8094/api/managerOptions \\\n  -d '{\"bleveMaxClauseCount\": \"10000\"}'",
+      "language": "bash"
+    },
+    {
+      "title": "4. Zero-Downtime GKE Node Pool Migration Workflow",
+      "description": "Safely migrates running Couchbase StatefulSet pods from standard nodes to high-memory nodes without downtime.",
+      "code": "# 1. Create target high-memory node pool\ngcloud container node-pools create couchbase-big \\\n  --cluster arogya-couchbase-cluster1 --zone asia-southeast1-a \\\n  --machine-type e2-highmem-8 --disk-size 32 --num-nodes 1\n\n# 2. Cordon and safely drain existing nodes\nkubectl cordon <old-node-name>\nkubectl drain <old-node-name> --ignore-daemonsets --delete-emptydir-data\n\n# 3. Clean up decommissioned pool once pods are re-scheduled\ngcloud container node-pools delete default-pool \\\n  --cluster arogya-couchbase-cluster1 --zone asia-southeast1-a",
+      "language": "bash"
+    }
+  ],
+  "impact": [
+    "Successfully deployed high-availability Couchbase Enterprise 7.6.9 clusters across hospital environments (e.g. Hemas tbd3).",
+    "Resolved \"pindex not available\" and search clause crashes by tuning FTS memory allocation to 24 GB and raising bleveMaxClauseCount to 10,000.",
+    "Automated pod joining and rebalancing, enabling seamless vertical node pool upgrades with zero data loss."
+  ],
+  "lessons": [
+    "Databases in Kubernetes require dedicated StatefulSet postStart lifecycle hooks that distinguish between seed node initialization and secondary node cluster-joining.",
+    "Multi-dimensional scaling in Couchbase means memory quotas must reflect actual workload profiles: in clinical systems with heavy text and dynamic FHIR searching, FTS requires substantially more RAM than standard key-value caching."
+  ],
+  "number": "004",
+  "id": 4
+}

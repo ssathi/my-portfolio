@@ -1,0 +1,69 @@
+{
+  "slug": "ansible-zero-downtime-server-setup-tuning",
+  "title": "Zero-Downtime Server Setup, Dynamic Routing & Runtime Tuning with Ansible",
+  "subtitle": "Automating multi-tenant hospital microservice deployments, Consul service discovery, OpenResty Lua SSL, and jemalloc OS memory tuning.",
+  "category": "DevOps & Systems",
+  "date": "2019",
+  "readTime": "14 min read",
+  "tags": [
+    "Ansible",
+    "OpenResty",
+    "Consul",
+    "Consul-Template",
+    "jemalloc",
+    "Ubuntu 24.04 LTS",
+    "Zero-Downtime"
+  ],
+  "metrics": [
+    {
+      "label": "Playbook Tasks",
+      "value": "110+"
+    },
+    {
+      "label": "Deploy Downtime",
+      "value": "0 seconds"
+    },
+    {
+      "label": "Off-Heap Frag Drop",
+      "value": "~40%"
+    },
+    {
+      "label": "OS Migration",
+      "value": "Ubuntu 24.04 LTS"
+    }
+  ],
+  "overview": "Deploying updates across hospital environments requires mathematical precision: emergency departments, ICU admissions, and outpatient pharmacies cannot tolerate maintenance windows or downtime. In Arogya Platform, I built an end-to-end automation suite in Ansible that orchestrates OS provisioning, low-level Linux memory tuning, dynamic reverse-proxy discovery with Consul and OpenResty, and automated pre-deployment backup snapshots.",
+  "problem": "Enterprise hospital operations present unique DevOps hurdles:\n1. **Severe Memory Fragmentation under High Throughput:** High-throughput JVM services utilizing RocksDB and Netty suffer from virtual memory bloat and fragmentation under standard glibc `malloc`, resulting in out-of-memory (OOM) kernel kills during peak outpatient hours.\n2. **Dynamic Ingress without Reload Outages:** Microservices (`arogya-core`, `arogya-magma`, `arogya-pulse`) restart or scale independently. Static NGINX configurations drop active WebSocket and GraphQL subscription connections whenever a upstream changes.\n3. **Tenant Customization Drift:** Each hospital profile requires custom database connection strings, license tokens, thermal receipt printer IPs, and third-party laboratory API keys.",
+  "architecture": "The Ansible automation pipeline separates foundational system tuning, dynamic edge routing, and application lifecycle:\n```\n┌────────────────────────────────────────────────────────────────────────┐\n│                        Ansible Automation Engine                       │\n│     (Targeting hosts: hemas, medihelp, durdans, singhe, visioncare)    │\n└───────────────────────────────────┬────────────────────────────────────┘\n                                    │\n       ┌────────────────────────────┼────────────────────────────┐\n       ▼                            ▼                            ▼\n┌─────────────────────┐    ┌─────────────────────┐    ┌─────────────────────┐\n│ 1. Low-Level OS &   │    │ 2. Dynamic Gateway  │    │ 3. Microservice &   │\n│    Runtime Tuning   │    │    & Ingress        │    │    Rolling Backups  │\n│ ├─ Ubuntu 24.04 LTS │    │ ├─ NGINX OpenResty  │    │ ├─ Pre-deploy backup│\n│ ├─ OpenJDK 17       │    │ ├─ Consul Discovery │    │    snapshots        │\n│ ├─ jemalloc Memory  │    │ ├─ Consul-Template  │    │ ├─ Core, Magma, Web,│\n│    Allocation Tuning│    │    (dynamic reload) │    │    Pulse, Radar     │\n│ └─ dnsmasq caching  │    │ └─ Auto-SSL (ACME)  │    │ └─ Docker+Metabase  │\n└─────────────────────┘    └─────────────────────┘    └─────────────────────┘\n```",
+  "implementation": [
+    {
+      "title": "1. Eliminating Off-Heap Fragmentation with jemalloc OS Injection",
+      "description": "Automated the compilation and system-wide preload of jemalloc across production VMs to replace glibc malloc, drastically improving off-heap allocation efficiency for RocksDB and Netty.",
+      "code": "- name: Install jemalloc dependencies\n  apt:\n    name:\n      - build-essential\n      - libjemalloc-dev\n    state: present\n    update_cache: yes\n\n- name: Configure jemalloc preload environment\n  lineinfile:\n    path: /etc/environment\n    line: \"LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so\"\n    state: present",
+      "language": "yaml"
+    },
+    {
+      "title": "2. Dynamic Upstream Routing with Consul-Template & OpenResty",
+      "description": "Configured HashiCorp Consul service discovery with Consul-Template, enabling NGINX OpenResty to automatically detect backend service health and reload upstream blocks without dropping active WebSocket connections.",
+      "code": "upstream arogya_core_upstream {\n  {{ range service \"arogya-core\" }}\n  server {{ .Address }}:{{ .Port }} max_fails=3 fail_timeout=10s;\n  {{ else }}\n  server 127.0.0.1:8080 backup;\n  {{ end }}\n  keepalive 64;\n}\n\nserver {\n  listen 443 ssl http2;\n  server_name {{ env \"SERVER_NAME\" }};\n\n  location /graphql {\n    proxy_pass http://arogya_core_upstream;\n    proxy_http_version 1.1;\n    proxy_set_header Upgrade $http_upgrade;\n    proxy_set_header Connection \"upgrade\";\n  }\n}",
+      "language": "nginx"
+    },
+    {
+      "title": "3. Automated Pre-Deployment Rolling Directory Backups",
+      "description": "Implemented defensive deployment playbooks that capture compressed binary and local data state snapshots prior to unpacking new releases, enabling instant one-command rollbacks.",
+      "code": "- name: Create timestamped backup of current application binaries\n  command: >\n    tar -czf /var/backups/arogya/core_{{ ansible_date_time.iso8601_basic_short }}.tar.gz\n    -C /opt/arogya/core/current .\n  when: core_dir.stat.exists",
+      "language": "yaml"
+    }
+  ],
+  "impact": [
+    "Eliminated service downtime during production deployments, enabling mid-day rolling releases during active hospital operational shifts.",
+    "Reduced off-heap memory footprint by ~40% and completely resolved native memory fragmentation OOM crashes via jemalloc.",
+    "Successfully led the zero-downtime platform upgrade to Ubuntu 24.04 LTS across all production hospital clusters."
+  ],
+  "lessons": [
+    "High-throughput Java microservices interacting with native JNI libraries (RocksDB) require dedicated OS-level allocator tuning; the default glibc memory allocator is not optimized for high-churn off-heap allocations.",
+    "Coupling Consul-Template with NGINX OpenResty provides Kubernetes-like service discovery resilience without the operational overhead of a full container orchestrator on edge hospital servers."
+  ],
+  "number": "002",
+  "id": 2
+}

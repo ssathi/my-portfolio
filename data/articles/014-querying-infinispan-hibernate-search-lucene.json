@@ -1,0 +1,55 @@
+{
+  "id": 14,
+  "number": "014",
+  "slug": "querying-infinispan-hibernate-search-lucene",
+  "title": "Querying Infinispan with Hibernate Search & Lucene Query Builder",
+  "subtitle": "Building composable, type-safe full-text queries, boolean junctions, pagination, and sorting over distributed in-memory data grids.",
+  "category": "Distributed Systems",
+  "date": "2023",
+  "readTime": "9 min read",
+  "tags": [
+    "Hibernate Search",
+    "Infinispan",
+    "Apache Lucene",
+    "Java",
+    "Full-Text Search",
+    "Query Optimization"
+  ],
+  "metrics": [
+    { "label": "Query Engine", "value": "Hibernate Search" },
+    { "label": "Search Mode", "value": "IndexedQueryMode.FETCH" },
+    { "label": "Sorting", "value": "Multi-field Sort" }
+  ],
+  "overview": "Querying data within distributed caches requires expressive APIs that go far beyond primitive key lookups. By leveraging Hibernate Search's integration with Infinispan, engineers can construct rich boolean queries, full-text token search, fuzzy matches, and sorted pagination over structured domain entities. This article provides patterns and code implementations for production search pipelines.",
+  "problem": "In-memory key-value stores default to primary-key retrieval. As data grows, applications frequently need cross-entity filtering, full-text searches across multiple nested fields, and sorted pagination. Writing manual iterate-and-filter logic in application memory causes massive memory bloat and unacceptable latency.",
+  "architecture": "┌────────────────────────────────────────────────────────┐\n│ Application Query Layer                                │\n│                                                        │\n│   SearchManager searchManager = Search.getSearchMgr()  │\n│                            │                           │\n│                            ▼                           │\n│   QueryBuilder builder = searchMgr.buildQueryBuilder() │\n│                            │                           │\n│                            ▼                           │\n│   BooleanJunction & Keyword Query Construction         │\n│                            │                           │\n│                            ▼                           │\n│   CacheQuery<T> (Pagination: firstResult + maxResults) │\n└────────────────────────────┬───────────────────────────┘\n                             │ executes query\n                             ▼\n┌────────────────────────────────────────────────────────┐\n│ Infinispan Cache + Lucene Inverted Index               │\n│   - Parses boolean tokens and inverted index terms    │\n│   - Resolves matching document keys                    │\n│   - Hydrates domain objects via IndexedQueryMode.FETCH │\n└────────────────────────────────────────────────────────┘",
+  "implementation": [
+    {
+      "title": "1. Search Manager Initialization & Statistics",
+      "description": "Initialize the Infinispan SearchManager and enable search statistics to measure query duration, index latency, and execution plan metrics.",
+      "code": "// Initialize SearchManager on top of Infinispan cache instance\nSearchManager searchManager = Search.getSearchManager(cache);\nsearchManager.getStatistics().setStatisticsEnabled(true);",
+      "language": "java"
+    },
+    {
+      "title": "2. Composable Boolean Junction Query Construction",
+      "description": "Construct dynamic boolean search queries with should() (OR) and must() (AND) semantics over indexed fields.",
+      "code": "// Create entity-bound QueryBuilder\nQueryBuilder builder = searchManager.buildQueryBuilderForClass(PatientRecord.class).get();\n\n// Assemble boolean junction clauses\nBooleanJunction<BooleanJunction> booleanQuery = builder.bool();\n\n// Add fuzzy keyword match\nbooleanQuery.should(\n    builder.keyword()\n           .fuzzy()\n           .withEditDistanceUpTo(2)\n           .onField(\"patientName\")\n           .matching(searchTerm)\n           .createQuery()\n);\n\n// Add exact match filter\nbooleanQuery.must(\n    builder.keyword()\n           .onField(\"status\")\n           .matching(\"ACTIVE\")\n           .createQuery()\n);\n\nQuery query = booleanQuery.createQuery();",
+      "language": "java"
+    },
+    {
+      "title": "3. Pagination, Sorting & Result Hydration",
+      "description": "Execute the compiled query through CacheQuery with sort specifications and boundary parameters to protect memory consumption.",
+      "code": "public <T> List<T> searchWithPagination(\n    Query query,\n    Class<T> entityClass,\n    String sortField,\n    int page,\n    int size\n) {\n    CacheQuery<T> cacheQuery = searchManager.getQuery(query, IndexedQueryMode.FETCH, entityClass);\n    \n    Sort sort = new Sort(new SortField(sortField, SortField.Type.STRING, false));\n    \n    return cacheQuery\n        .sort(sort)\n        .firstResult(page * size)\n        .maxResults(size)\n        .list();\n}",
+      "language": "java"
+    }
+  ],
+  "impact": [
+    "Delivered flexible full-text fuzzy search across clinical entities with sub-10ms response times.",
+    "Prevented out-of-memory faults by enforcing strict page-size bounds (`maxResults`) on all query endpoints.",
+    "Provided transparent metrics on index queries via SearchManager statistics."
+  ],
+  "lessons": [
+    "Always specify `IndexedQueryMode.FETCH` only when full entity graphs are needed; use projected fields (`SKIP_LOADING`) for summary views to reduce object hydration overhead.",
+    "Ensure sort fields in entities are explicitly indexed as un-tokenized DocValues to avoid costly runtime field un-inverting in Lucene."
+  ]
+}

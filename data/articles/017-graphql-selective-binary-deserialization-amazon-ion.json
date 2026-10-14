@@ -1,0 +1,62 @@
+{
+  "id": 17,
+  "number": "017",
+  "slug": "graphql-selective-binary-deserialization-amazon-ion",
+  "title": "GraphQL-Driven Selective Binary Deserialization with Custom Amazon Ion Reader",
+  "subtitle": "Forking amazon-ion/ion-java to implement IonReaderBinaryUserXSelective: skipping unqueried binary payload fields directly at the wire parser level for sub-millisecond GraphQL queries.",
+  "category": "Distributed Systems",
+  "date": "2024",
+  "readTime": "15 min read",
+  "tags": [
+    "Amazon Ion",
+    "GraphQL",
+    "Binary Serialization",
+    "Java",
+    "Performance Optimization",
+    "Infinispan",
+    "Zero-Copy"
+  ],
+  "metrics": [
+    { "label": "Deserialization Overhead", "value": "-75%" },
+    { "label": "Wire Protocol", "value": "Amazon Ion Binary" },
+    { "label": "Parser Mode", "value": "Direct Skip (stepOut)" }
+  ],
+  "overview": "When clients execute sparse GraphQL or REST scalar projections requesting only a few fields (e.g., patient name and status from a 150-field clinical record), traditional application layers deserialize the full binary blob into heap memory before filtering out unwanted fields. To eliminate this memory allocation and CPU overhead, we contributed a selective binary streaming reader to our internal fork of Amazon Ion (`arogya-life/ion-java`). By pairing `IonReaderBinaryUserXSelective` with an endpoint GraphQL field selector tree, our data layer skips unselected struct and list bytes directly in binary wire format without ever hydrating them into Java objects.",
+  "problem": "Healthcare and financial domain entities contain large nested document graphs (identifiers, extensions, codeable concepts, audit logs). In high-throughput read paths like search and autocomplete grids, clients query scalar projections requiring only 2-3 fields. Standard deserializers (Jackson, default Amazon Ion) must traverse and parse every byte, allocate nested Java objects on the JVM heap, and subject the system to heavy GC cycles. Database projections can push selections to storage, but when reading binary-encoded documents from cache grids like Infinispan or RocksDB, full document hydration creates a massive performance bottleneck.",
+  "architecture": "┌────────────────────────────────────────────────────────────────────────┐\n│ Client Request: POST /scalar { query: {...}, selection: IonField }     │\n│ (e.g. selection = { id, name: { text }, status })                      │\n└───────────────────────────────────┬────────────────────────────────────┘\n                                    │\n                                    ▼\n┌────────────────────────────────────────────────────────────────────────┐\n│ BaseResourceApi:93 (queryScalar Endpoint)                              │\n│  - AuthorizationAdvice: links hierarchical parent-child IonField nodes │\n│  - repo().findBy(body.getQuery(), body.getSelection())                 │\n└───────────────────────────────────┬────────────────────────────────────┘\n                                    │\n                                    ▼\n┌────────────────────────────────────────────────────────────────────────┐\n│ ScalarSelectionQueryResultLoader                                      │\n│  - Retrieves raw binary payload: cache.withEncoding(IonEncoder).get()  │\n│  - Instantiates IonReaderBinaryUserXSelective(ionData, offset, fields) │\n└───────────────────────────────────┬────────────────────────────────────┘\n                                    │\n                                    ▼\n┌────────────────────────────────────────────────────────────────────────┐\n│ Custom Ion-Java Core: IonReaderBinaryUserXSelective                    │\n│                                                                        │\n│   Current Field in Selection Tree?                                     │\n│      ├─ YES (STRUCT/LIST) ──► stepIn(), descend selection hierarchy    │\n│      ├─ YES (SCALAR)     ──► Stream bytes directly to IonWriter        │\n│      └─ NO               ──► super.stepIn(); super.stepOut();          │\n│                               [SKIPS BYTE OFFSETS WITH ZERO ALLOCATION]│\n└───────────────────────────────────┬────────────────────────────────────┘\n                                    │\n                                    ▼\n┌────────────────────────────────────────────────────────────────────────┐\n│ Output: Filtered JSON/Ion Stream Response (Zero Unrequested Allocations)│\n└────────────────────────────────────────────────────────────────────────┘",
+  "implementation": [
+    {
+      "title": "1. Upstream Fork: The IonField Hierarchical Selection Model",
+      "description": "Introduced `IonField` in software.amazon.ion.impl.lite as a lightweight recursive tree modeling the client's requested selection set (matching GraphQL AST selections).",
+      "code": "package software.amazon.ion.impl.lite;\n\nimport java.io.Serializable;\nimport java.util.HashSet;\nimport java.util.Set;\n\npublic class IonField implements Serializable {\n    private String name;\n    private IonField parent;\n    private Set<IonField> fields = new HashSet<>();\n\n    public IonField() {}\n    public IonField(String name, IonField parent) {\n        this.name = name;\n        this.parent = parent;\n    }\n\n    public boolean contains(String name) {\n        for (IonField field : fields) {\n            if (field.name.equals(name)) return true;\n        }\n        return false;\n    }\n\n    public IonField getField(String name) {\n        for (IonField field : fields) {\n            if (field.name.equals(name)) return field;\n        }\n        return null;\n    }\n    // Getters and Setters omitted for brevity\n}",
+      "language": "java"
+    },
+    {
+      "title": "2. Core Binary Parser Engine: IonReaderBinaryUserXSelective",
+      "description": "Extended Amazon Ion's binary reader (`IonReaderBinaryUserX`). During `.next()`, if a struct or list field is not present in the active selection tree node, it executes an immediate `super.stepIn()` followed by `super.stepOut()`, jumping the binary pointer over child length bytes without allocating symbols or decoding values.",
+      "code": "package software.amazon.ion.impl;\n\nimport software.amazon.ion.IonSystem;\nimport software.amazon.ion.IonType;\nimport software.amazon.ion.SystemSymbols;\nimport software.amazon.ion.impl.lite.IonField;\n\npublic class IonReaderBinaryUserXSelective extends IonReaderBinaryUserX {\n\n    private IonField _current;\n    private int hierarchy = 0;\n    private int scalarLevel = Integer.MAX_VALUE;\n\n    public IonReaderBinaryUserXSelective(byte[] data, int offset, int length,\n                                         IonSystem system, IonField _current) {\n        super(system, system.getCatalog(), UnifiedInputStreamX.makeStream(data, offset, length));\n        this._current = _current;\n    }\n\n    @Override\n    public IonType next() {\n        IonType type = super.next();\n        if (type == null) return null;\n\n        String fieldName = getFieldName();\n        if (fieldName == null || SystemSymbols.SYMBOLS.equals(fieldName) || scalarLevel != Integer.MAX_VALUE) {\n            return type;\n        }\n\n        if (type == IonType.STRUCT || type == IonType.LIST) {\n            IonField field = _current.getField(fieldName);\n            if (field != null) {\n                this._current = field;\n                if (field.getFields().isEmpty()) {\n                    scalarLevel = hierarchy;\n                }\n                return type;\n            } else {\n                // Byte-level skip: Step in and immediately out to advance parser offset past block\n                super.stepIn();\n                super.stepOut();\n            }\n            return next();\n        } else {\n            if (this._current.contains(fieldName)) {\n                return type;\n            } else {\n                return next();\n            }\n        }\n    }\n\n    @Override\n    public void stepIn() {\n        hierarchy = (hierarchy << 1);\n        if (getFieldName() != null && !SystemSymbols.SYMBOLS.equals(getFieldName())) {\n            hierarchy = hierarchy + 1;\n        }\n        super.stepIn();\n    }\n\n    @Override\n    public void stepOut() {\n        if ((hierarchy & 1) == 1 && scalarLevel == Integer.MAX_VALUE) {\n            this._current = this._current.getParent();\n        }\n        hierarchy = hierarchy >> 1;\n        if (scalarLevel != Integer.MAX_VALUE && scalarLevel == hierarchy) {\n            this._current = this._current.getParent();\n            scalarLevel = Integer.MAX_VALUE;\n        }\n        super.stepOut();\n    }\n}",
+      "language": "java"
+    },
+    {
+      "title": "3. Endpoint Integration: BaseResourceApi & Aspect Wire-Up",
+      "description": "Exposed the scalar projection endpoint in BaseResourceApi:93. An AOP advice automatically links bidirectional parent-child references across the deserialized IonField graph before query execution.",
+      "code": "/* BaseResourceApi.java:93 */\n@POST\n@Path(\"/scalar\")\n@FHIRValidated\n@Consumes(MediaType.APPLICATION_JSON)\n@Produces(MediaType.APPLICATION_JSON)\npublic Response queryScalar(@Context ServiceContext ctx, RestRequestBody<Q> body) {\n    try (Stream<Object> stream = service.repo().findBy(body.getQuery(), body.getSelection())) {\n        return response(Result.of(ctx, stream.collect(Collectors.toList())));\n    }\n}\n\n/* AuthorizationAdvice.java */\nprivate void setupSelection(ProceedingJoinPoint point) {\n    Object body = point.getArgs()[1];\n    if (body instanceof RestRequestBody) {\n        IonField root = ((RestRequestBody<?>) body).getSelection();\n        setParent(root, root.getFields());\n    }\n}\n\nprivate void setParent(IonField parent, Set<IonField> children) {\n    for (IonField child : children) {\n        child.setParent(parent);\n        if (!child.getFields().isEmpty()) {\n            setParent(child, child.getFields());\n        }\n    }\n}",
+      "language": "java"
+    },
+    {
+      "title": "4. Zero-Hydration Streaming: ScalarSelectionQueryResultLoader",
+      "description": "Connected the Infinispan cache byte layer directly to the selective reader, writing matched tokens straight into a JSON text writer without allocating intermediary domain entity POJOs.",
+      "code": "public class ScalarSelectionQueryResultLoader implements QueryResultLoader {\n    private final AdvancedCache<?, ?> cache;\n    private final IonSystem ionSystem = IonSystemBuilder.standard().build();\n    private final IonField fields;\n\n    @Override\n    public Object load(EntityInfo entityInfo) {\n        try {\n            // Fetch raw binary Amazon Ion bytes directly from cache store\n            byte[] ionData = (byte[]) cache.withEncoding(IonEncoder.class).get(decodeKey(entityInfo));\n\n            // Selective reader skips unselected fields at byte level\n            IonReader ionReader = new IonReaderBinaryUserXSelective(\n                    ionData, 5, ionData.length - 5,\n                    ionSystem, fields\n            );\n            StringBuilder builder = new StringBuilder();\n            IonWriter ionWriter = IonTextWriterBuilder.json().build(builder);\n\n            // Pipe directly to output JSON without POJO object instantiation\n            ionWriter.writeValues(ionReader);\n            return builder.toString();\n        } catch (IOException e) {\n            throw new RuntimeException(e);\n        }\n    }\n}",
+      "language": "java"
+    }
+  ],
+  "impact": [
+    "Cut API response serialization latency by over 75% for scalar and grid queries requesting subsets of domain documents.",
+    "Completely bypassed JVM heap object instantiation for unrequested fields, mitigating GC pause frequency on high-concurrency search clusters.",
+    "Achieved seamless protocol compatibility: GraphQL clients send arbitrary field masks while backend storage remains compact, raw Amazon Ion binary."
+  ],
+  "lessons": [
+    "In binary formats with explicit length-prefix encoding (like Amazon Ion, Protobuf, and BSON), skipping unneeded subtrees by incrementing parser byte offsets is orders of magnitude cheaper than instantiating reflection-based POJOs.",
+    "Bitwise hierarchy tracking (`hierarchy << 1` and `hierarchy >> 1`) provides an ultra-fast O(1) mechanism for tracking nested struct depth without array or stack allocations."
+  ]
+}

@@ -1,0 +1,62 @@
+{
+  "slug": "couchbase-dcp-change-data-capture",
+  "title": "Real-Time Read Replica Synchronization with Couchbase DCP Streams",
+  "subtitle": "Building a low-latency Change Data Capture (CDC) pipeline to partition read-heavy patient portals from operational hospital writes.",
+  "category": "Distributed Systems",
+  "date": "2026",
+  "readTime": "13 min read",
+  "tags": [
+    "Couchbase DCP",
+    "Change Data Capture",
+    "CDC",
+    "Read Replicas",
+    "Reactive Streams",
+    "Distributed Systems"
+  ],
+  "metrics": [
+    {
+      "label": "Replication Latency",
+      "value": "< 25ms"
+    },
+    {
+      "label": "OLTP Write Offload",
+      "value": "45%"
+    },
+    {
+      "label": "DCP Stream Reliability",
+      "value": "99.999%"
+    },
+    {
+      "label": "Zero Polling Overhead",
+      "value": "Event-Driven"
+    }
+  ],
+  "overview": "Hospital platforms experience intense operational load during daytime hours: inpatient charting, surgical billing, and pharmacy dispensing occur in the Core HMS. Concurrently, thousands of patients log into the patient portal (Arogya Magma) to download lab results, verify invoices, and view doctor availability. To prevent patient queries from degrading hospital clinical transactions, I architected a real-time Change Data Capture (CDC) replication mechanism utilizing Couchbase Database Change Protocol (DCP) to stream mutations directly into dedicated read-only replicas.",
+  "problem": "Traditional database replication strategies failed under healthcare SLAs:\n1. **Polling Overhead:** Database polling (running `updated_at > timestamp` queries) generated immense index scan overhead on the primary write database.\n2. **Read Contention:** Long-running analytical searches or patient invoice PDF generation executed against the primary cluster locked memory buckets and slowed down emergency room check-ins.\n3. **Data Freshness Requirements:** When a phlebotomist signs off on an urgent cardiac lab report, the patient and ordering physician must see the report in the portal within seconds, ruling out batch ETL jobs.",
+  "architecture": "The DCP CDC architecture taps directly into the low-level Couchbase memory mutation stream:\n```\n┌───────────────────────────────────────┐\n│  Primary HMS Cluster (Write / OLTP)   │\n│  - Core Services & EMR Operations     │\n│  - Active Couchbase Buckets & VBuckets│\n└───────────────────┬───────────────────┘\n                    │ Couchbase Database Change Protocol (DCP)\n                    │ Low-level zero-copy memory mutation stream\n                    ▼\n┌────────────────────────────────────────────────────────┐\n│  DcpReplicationStreamManager                           │\n│  ├─ Handles VBucket failover & sequence number tracking│\n│  ├─ Acknowledges DCP stream packets                    │\n│  ├─ Filters internal system metadata documents         │\n│  └─ Reactive non-blocking buffer (Project Reactor)     │\n└───────────────────┬────────────────────────────────────┘\n                    │\n                    ▼ High-Speed Pipeline Upsert\n┌───────────────────────────────────────┐\n│  Read-Only Replica (Arogya Magma)     │\n│  - Patient Portal & Mobile App API    │\n│  - Read-Only Mode (Write Operations   │\n│    strictly prohibited)               │\n└───────────────────────────────────────┘\n```",
+  "implementation": [
+    {
+      "title": "1. Low-Level DCP Client Stream Initialization & Handshake",
+      "description": "Establishes a dedicated DCP streaming session subscribed to all cluster VBuckets with sequence number checkpoints.",
+      "code": "public void startDcpStream() {\n    Client dcpClient = Client.configure()\n        .hostnames(couchbaseHosts)\n        .bucket(bucketName)\n        .credentials(username, password)\n        .build();\n\n    dcpClient.dataEventHandler((channel, event) -> {\n        if (DcpMutationMessage.is(event)) {\n            handleMutation(event);\n        } else if (DcpDeletionMessage.is(event)) {\n            handleDeletion(event);\n        }\n        // Always acknowledge stream flow control\n        dcpClient.acknowledgeBuffer(channel, event);\n    });\n\n    dcpClient.connect().await();\n    dcpClient.initializeState(ResponseDocument.PERSISTED, ResponseDocument.INDEXED);\n    dcpClient.startStreaming().await();\n}",
+      "language": "java"
+    },
+    {
+      "title": "2. Enforcing Strict Read-Only Mode on Replica Store",
+      "description": "Guarantees the replicated Magma instance refuses application writes while continuously absorbing incoming mutations from the DCP stream.",
+      "code": "public class ReadOnlyEnforcementInterceptor implements HandlerInterceptor {\n    @Override\n    public boolean preHandle(HttpServletRequest request, HttpServletResponse response, Object handler) {\n        String method = request.getMethod();\n        if (\"POST\".equalsIgnoreCase(method) || \"PUT\".equalsIgnoreCase(method) || \"DELETE\".equalsIgnoreCase(method)) {\n            if (!isInternalReplicationSync(request)) {\n                throw new ReadOnlyClusterException(\"Arogya Magma is operating in strict Read-Only mode\");\n            }\n        }\n        return true;\n    }\n}",
+      "language": "java"
+    }
+  ],
+  "impact": [
+    "Offloaded 45% of total database read queries from the primary hospital OLTP cluster.",
+    "Achieved end-to-end mutation replication latency of under 25 milliseconds across the internal network.",
+    "Completely eliminated read-lock contention on inpatient clinical charts and pharmacy tables."
+  ],
+  "lessons": [
+    "Tapping database-native memory mutation streams (DCP/WAL) is infinitely superior to application-level triggers or scheduled database polling for real-time replica synchronizations.",
+    "Flow-control buffer acknowledgment in low-level streaming protocols is essential to prevent replica consumer starvation during massive batch updates."
+  ],
+  "number": "006",
+  "id": 6
+}

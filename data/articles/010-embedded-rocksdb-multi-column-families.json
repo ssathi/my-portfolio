@@ -1,0 +1,64 @@
+{
+  "slug": "embedded-rocksdb-multi-column-families",
+  "title": "Embedded RocksDB Storage Engine: Multi-Column Families & Cloud Snapshots",
+  "subtitle": "Engineering high-throughput LSM-tree storage, column family segregation, and hot compressed cloud backups to AWS S3 & Azure Blob.",
+  "category": "Database Architecture",
+  "date": "2019",
+  "readTime": "15 min read",
+  "tags": [
+    "RocksDB",
+    "LSM-Tree",
+    "Infinispan",
+    "C++",
+    "Java JNI",
+    "AWS S3",
+    "Azure Blob",
+    "Backup & Restore"
+  ],
+  "metrics": [
+    {
+      "label": "Tickets Solved",
+      "value": "ARO-862, ARO-180"
+    },
+    {
+      "label": "Storage Segregation",
+      "value": "Multi-Column Family"
+    },
+    {
+      "label": "Hot Backup Uptime",
+      "value": "Zero-Pause"
+    },
+    {
+      "label": "Disaster Recovery",
+      "value": "AWS S3 & Azure Blob"
+    }
+  ],
+  "overview": "In the early architectural phases of Arogya Platform, storing high-volume clinical time-series, audit logs, and cache indexes required sub-millisecond write latency without the overhead of heavy external database servers. We integrated Facebook's RocksDB—an embedded persistent Key-Value store based on Log-Structured Merge (LSM) trees—as a custom storage backend for Infinispan. Under tickets ARO-862 and ARO-180, I architected the migration from single-column families to Multi-Column Families and built automated, zero-downtime hot snapshot backups streaming to AWS S3 and Azure Blob Storage via Apache jclouds.",
+  "problem": "Running embedded LSM-tree storage inside a mission-critical hospital system introduced severe low-level systems engineering hurdles:\n1. **LSM-Tree Compaction Interference:** Mixing high-churn temporary cache counters with long-lived clinical records in a single column family caused massive write amplification and compaction stalls across the entire database.\n2. **Zero-Pause Hot Cloud Backups:** Backing up active RocksDB SSTables while outpatient transactions were writing required atomic, point-in-time snapshots without taking the database offline.\n3. **JNI Crash Safety:** Incompatible native C++ library binaries or unhandled native pointers within RocksDB JNI wrappers risked crashing the entire Java Virtual Machine (JVM).",
+  "architecture": "The Multi-Column Family and hot backup architecture:\n```\n┌────────────────────────────────────────────────────────┐\n│  Infinispan Cache Engine                               │\n│  - Clinical Records Cache  - Audit Log Cache           │\n│  - Sequence Counter Cache  - User Session Cache        │\n└───────────────────┬────────────────────────────────────┘\n                    │ JNI Bridge\n                    ▼\n┌────────────────────────────────────────────────────────┐\n│  RocksDB Embedded Engine (Multi-Column Families)       │\n│  ├─ ColumnFamily: 'clinical_data' (High durability)    │\n│  ├─ ColumnFamily: 'audit_logs'    (Append-heavy)       │\n│  ├─ ColumnFamily: 'counters'      (In-memory MemTable) │\n│  └─ ColumnFamily: 'default'                            │\n└───────────────────┬────────────────────────────────────┘\n                    │\n                    ▼ Atomic Checkpoint Engine\n┌────────────────────────────────────────────────────────┐\n│  Snapshot & Backup Orchestrator (ARO-180)              │\n│  ├─ Takes RocksDB Checkpoint (Hard links SSTables)     │\n│  ├─ Compresses checkpoint into Gzip archive            │\n│  └─ Asynchronously streams to Cloud Storage            │\n│     (AWS S3 / Azure Blob Storage via Apache jclouds)   │\n└────────────────────────────────────────────────────────┘\n```",
+  "implementation": [
+    {
+      "title": "1. Multi-Column Family Initialization & Descriptor Configuration",
+      "description": "Segregates discrete application datasets into independent column families, isolating LSM compaction write amplification and tuning memtable budgets per data type.",
+      "code": "public DBOptions configureRocksDb(List<ColumnFamilyDescriptor> cfDescriptors) {\n    DBOptions options = new DBOptions()\n        .setCreateIfMissing(true)\n        .setCreateMissingColumnFamilies(true)\n        .setMaxBackgroundJobs(4)\n        .setBytesPerSync(1048576);\n\n    // Independent Column Families\n    cfDescriptors.add(new ColumnFamilyDescriptor(\n        \"clinical_data\".getBytes(StandardCharsets.UTF_8), \n        new ColumnFamilyOptions().setCompressionType(CompressionType.LZ4_COMPRESSION)));\n        \n    cfDescriptors.add(new ColumnFamilyDescriptor(\n        \"counters\".getBytes(StandardCharsets.UTF_8), \n        new ColumnFamilyOptions().setWriteBufferSize(64 * 1024 * 1024)));\n\n    return options;\n}",
+      "language": "java"
+    },
+    {
+      "title": "2. Zero-Pause Hot Checkpoint Backup to Cloud Object Storage",
+      "description": "Creates atomic hard-linked RocksDB checkpoints and streams compressed archives asynchronously to AWS S3 or Azure Blob Storage.",
+      "code": "public void createCloudSnapshot(String backupName) {\n    File checkpointDir = new File(\"/tmp/rocksdb_checkpoint_\" + System.currentTimeMillis());\n    Checkpoint checkpoint = Checkpoint.create(rocksDbInstance);\n    checkpoint.createCheckpoint(checkpointDir.getAbsolutePath());\n\n    CompletableFuture.runAsync(() -> {\n        try {\n            File compressedArchive = compressDirectory(checkpointDir);\n            uploadToCloudStorage(compressedArchive, backupName);\n        } finally {\n            FileUtils.deleteDirectory(checkpointDir);\n        }\n    }, backupExecutor);\n}",
+      "language": "java"
+    }
+  ],
+  "impact": [
+    "Eliminated compaction write stalls by isolating short-lived counters from durable clinical patient data across distinct column families.",
+    "Achieved automated, zero-downtime hot snapshots streamed directly to AWS S3 and Azure Blob Storage.",
+    "Resolved JVM crash vectors through defensive memory management and robust JNI lifecycle handling."
+  ],
+  "lessons": [
+    "In LSM-tree storage engines, co-locating data with disparate read/write lifecycles inside the same column family destroys compaction performance.",
+    "Utilizing RocksDB hard-link checkpoints enables true zero-downtime hot backups without disk I/O duplication."
+  ],
+  "number": "010",
+  "id": 10
+}

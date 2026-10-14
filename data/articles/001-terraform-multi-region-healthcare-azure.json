@@ -1,0 +1,68 @@
+{
+  "slug": "terraform-multi-region-healthcare-azure",
+  "title": "Multi-Region Healthcare Cloud Provisioning on Azure with Terraform",
+  "subtitle": "Designing HIPAA-compliant, hybrid-cloud network topologies with Site-to-Site IPsec VPN and automated geo-routing for 11+ hospital networks.",
+  "category": "Cloud & IaC",
+  "date": "2022",
+  "readTime": "12 min read",
+  "tags": [
+    "Terraform",
+    "Microsoft Azure",
+    "Site-to-Site VPN",
+    "Traffic Manager",
+    "IaC",
+    "Enterprise Security"
+  ],
+  "metrics": [
+    {
+      "label": "Hospitals Deployed",
+      "value": "11+"
+    },
+    {
+      "label": "Provisioning Time",
+      "value": "< 15 mins"
+    },
+    {
+      "label": "Network Uptime",
+      "value": "99.99%"
+    },
+    {
+      "label": "Environments Managed",
+      "value": "25+ VNets"
+    }
+  ],
+  "overview": "Enterprise healthcare platforms cannot afford single points of failure. Hospital branches, diagnostic laboratories, and phlebotomy stations depend on uninterrupted cloud access, while hospital-grade compliance demands strict physical and virtual boundary segregation. In the Arogya platform, I architected and automated the entire cloud provisioning lifecycle on Microsoft Azure using Terraform, establishing parameterized, multi-region environments for major hospital clients including Hemas Hospitals, Medihelp, Singhe, Durdans, and Vision Care.",
+  "problem": "Hospital operations pose unique infrastructure challenges that standard web architectures cannot handle:\n1. **Hybrid On-Premise Connectivity:** Physical hospital diagnostic devices (hematology analyzers, automated lab machines, bedside monitors) reside on internal hospital local area networks (LANs) and must securely stream results to cloud backends without exposing clinical endpoints to public internet ingress.\n2. **Strict Multi-Tenant Isolation:** Major hospital enterprises require dedicated, cryptographically isolated environments (VNet, subnets, database disks) while the core platform engineering team needs a single, unified IaC template to roll out updates and environments consistently.\n3. **Disaster Recovery & High Availability:** Hospital emergency rooms operate 24/7. Outages in an Azure primary data center region must automatically failover to secondary standby regions with zero manual DNS reconfiguration.",
+  "architecture": "The Terraform architecture employs a dual-region active/standby and geo-distributed topology:\n```\n                      Azure Traffic Manager (Geo-Routing & Failover)\n                                      │\n            ┌─────────────────────────┴─────────────────────────┐\n            ▼                                                   ▼\n┌───────────────────────────────────────┐   ┌───────────────────────────────────────┐\n│ Primary Region (Rg1: Southeast Asia)  │   │ Secondary Region (Rg2: East Asia)     │\n│  Virtual Network: 10.10.x.0/24        │   │  Virtual Network: 10.10.y.0/24        │\n│  ├─ AppSubnet (/27)                   │   │  ├─ AppSubnet (/27)                   │\n│  │  └─ Core HMS & Magma VMs           │   │  │  └─ Standby Replica VMs            │\n│  ├─ DataSubnet (/27)                  │   │  ├─ DataSubnet (/27)                  │\n│  │  └─ High-IOPS Premium Managed Disks│   │  │  └─ Disaster Recovery Replicated   │\n│  └─ GatewaySubnet (/27)               │   │  └─ GatewaySubnet (/27)               │\n│     └─ Azure VPN Gateway              │   │                                       │\n└───────────────────▲───────────────────┘   └───────────────────────────────────────┘\n                    │ IPsec IKEv2 Tunnel\n┌───────────────────┴───────────────────┐\n│ Hospital On-Premise LAN               │\n│ (Local Phlebotomy, Clinics, Analyzers)│\n└───────────────────────────────────────┘\n```",
+  "implementation": [
+    {
+      "title": "1. Modular Client Topology Parameterization",
+      "description": "Parameterized each hospital enterprise profile (Hemas, Medihelp, Singhe) into reusable Terraform definitions where CIDR subnets, region locations, and disk performance tiers are passed as variables.",
+      "code": "variable \"prefix\" {\n  description = \"Client deployment prefix (e.g. hemas, medihelp, durdans)\"\n  default     = \"medihelp\"\n}\n\nvariable \"location1\" {\n  default = \"Southeast Asia\"\n}\n\nvariable \"location2\" {\n  default = \"East Asia\"\n}\n\nresource \"azurerm_resource_group\" \"Rg1\" {\n  name     = \"${var.prefix}-Rg1\"\n  location = \"${var.location1}\"\n}\n\nresource \"azurerm_virtual_network\" \"Vnet1\" {\n  name                = \"${var.prefix}-Vnet1\"\n  location            = \"${var.location1}\"\n  address_space       = [\"10.10.60.0/24\"]\n  resource_group_name = azurerm_resource_group.Rg1.name\n}",
+      "language": "hcl"
+    },
+    {
+      "title": "2. Dedicated GatewaySubnet and IPsec VPN Integration",
+      "description": "Provisioned dedicated Azure Virtual Network Gateways with route-based VPN connectivity to bridge hospital on-premise hardware securely into the private cloud without public IP exposure.",
+      "code": "resource \"azurerm_subnet\" \"GatewaySubnet\" {\n  name                 = \"GatewaySubnet\"\n  address_prefix       = \"10.10.60.224/27\"\n  virtual_network_name = azurerm_virtual_network.Vnet1.name\n  resource_group_name  = azurerm_resource_group.Rg1.name\n}\n\nresource \"azurerm_public_ip\" \"VpnIp\" {\n  name                = \"${var.prefix}-Vpn-Ip1\"\n  location            = var.location1\n  resource_group_name = azurerm_resource_group.Rg1.name\n  allocation_method   = \"Dynamic\"\n}",
+      "language": "hcl"
+    },
+    {
+      "title": "3. Traffic Manager Health Probing and Automated Failover",
+      "description": "Configured global DNS-level routing and health probes across hospital clusters to automate instant failover in case of cloud region impairment.",
+      "code": "resource \"azurerm_traffic_manager_profile\" \"TrafficProfile\" {\n  name                   = \"${var.prefix}-traffic-manager\"\n  resource_group_name    = azurerm_resource_group.Rg1.name\n  traffic_routing_method = \"Performance\"\n\n  dns_config {\n    relative_name = \"${var.prefix}-arogya\"\n    ttl           = 60\n  }\n\n  monitor_config {\n    protocol                     = \"HTTPS\"\n    port                         = 443\n    path                         = \"/health\"\n    interval_in_seconds          = 30\n    timeout_in_seconds           = 10\n    tolerated_number_of_failures = 3\n  }\n}",
+      "language": "hcl"
+    }
+  ],
+  "impact": [
+    "Reduced hospital client environment spin-up time from weeks of manual Azure portal configuration to under 15 minutes.",
+    "Achieved zero clinical data leaks and eliminated public IP exposure for hospital-internal diagnostic analyzers.",
+    "Successfully powered 11+ hospital networks across 25+ isolated production and staging virtual networks with 99.99% infrastructure availability."
+  ],
+  "lessons": [
+    "In hybrid healthcare topologies, network micro-segmentation at the subnet layer with explicit NSG priority hierarchies is far easier to audit than ad-hoc host firewalls.",
+    "Upgrading Terraform provider versions across production environments must be managed via strict state locking and automated plan verification pipelines."
+  ],
+  "number": "001",
+  "id": 1
+}

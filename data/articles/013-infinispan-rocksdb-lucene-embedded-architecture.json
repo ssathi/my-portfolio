@@ -1,0 +1,61 @@
+{
+  "id": 13,
+  "number": "013",
+  "slug": "infinispan-rocksdb-lucene-embedded-architecture",
+  "title": "Integrating Infinispan with RocksDB and Lucene: A Complete Architecture",
+  "subtitle": "Designing an embedded in-memory data grid backed by custom RocksDB disk persistence and synchronous Lucene indexing with near-real-time index flushing.",
+  "category": "Database Architecture",
+  "date": "2023",
+  "readTime": "13 min read",
+  "tags": [
+    "Infinispan",
+    "RocksDB",
+    "Apache Lucene",
+    "Java",
+    "Embedded Database",
+    "Full-Text Search"
+  ],
+  "metrics": [
+    { "label": "Storage Engine", "value": "RocksDB LSM" },
+    { "label": "Search Engine", "value": "Lucene NRT" },
+    { "label": "Execution Mode", "value": "Sync Indexing" }
+  ],
+  "overview": "Combining an in-memory data grid with embedded disk persistence and full-text search yields sub-millisecond retrieval speeds with rich query capabilities. This architectural deep-dive details our custom integration of Infinispan with a bespoke RocksDB AdvancedLoadWriteStore backend and synchronous Apache Lucene near-real-time (NRT) indexing pipeline.",
+  "problem": "Standard relational databases incur high overhead for intensive key-value reads combined with fuzzy search. Conversely, pure in-memory caches risk total data loss on node failure, and external search engines like Elasticsearch introduce network hops and eventual consistency lag. We needed embedded sub-millisecond reads, reliable disk persistence on SSDs, and instant search indexing within the same JVM process.",
+  "architecture": "┌────────────────────────────────────────────────────────────────────────┐\n│ JVM Process Memory Space                                               │\n│                                                                        │\n│   ┌────────────────────────────────────────────────────────────────┐   │\n│   │ Infinispan CacheManager (Binary Storage / Repeatable Read)    │   │\n│   └───────────────┬───────────────────────────────┬────────────────┘   │\n│                   │ write / load                  │ index updates      │\n│                   ▼                               ▼                    │\n│   ┌───────────────────────────────┐ ┌──────────────────────────────┐   │\n│   │ Custom RocksDbStoreV2         │ │ Apache Lucene IndexWriter    │   │\n│   │ (AdvancedLoadWriteStore)      │ │ (NRTExtIndexManager - Sync)  │   │\n│   └───────────────┬───────────────┘ └─────────────┬────────────────┘   │\n└───────────────────┼───────────────────────────────┼────────────────────┘\n                    ▼                               ▼\n┌───────────────────────────────────┐ ┌──────────────────────────────────┐\n│ RocksDB SST Files (Local NVMe)    │ │ Lucene Index Segments (Local FS) │\n│ - LSM-Tree Key-Value Compaction   │ │ - Inverted Index Directory       │\n└───────────────────────────────────┘ └──────────────────────────────────┘",
+  "implementation": [
+    {
+      "title": "1. Custom RocksDB AdvancedLoadWriteStore Implementation",
+      "description": "Implemented Infinispan's AdvancedLoadWriteStore SPI to bridge memory entries directly to an embedded RocksDB instance with batch writing and marshalled entry serialization.",
+      "code": "@Store\n@SuppressWarnings(\"unchecked\")\n@ConfiguredBy(RocksDbStoreConfigurationV2.class)\npublic class RocksDbStoreV2<K, V> implements AdvancedLoadWriteStore<K, V> {\n\n    private RocksDB db;\n    private Options options;\n\n    @Override\n    public void start() {\n        this.options = new Options().setCreateIfMissing(true);\n        this.db = RocksDB.open(options, dbPath);\n    }\n\n    @Override\n    public void write(MarshalledEntry me) {\n        byte[] keyBytes = marshaller.objectToByteBuffer(me.getKey());\n        byte[] valBytes = me.getValueBytes().getBuf();\n        db.put(keyBytes, valBytes);\n    }\n\n    @Override\n    public MarshalledEntry load(Object key) {\n        byte[] keyBytes = marshaller.objectToByteBuffer(key);\n        byte[] valBytes = db.get(keyBytes);\n        if (valBytes == null) return null;\n        return entryFactory.create(key, valBytes);\n    }\n\n    @Override\n    public void writeBatch(Iterable<MarshalledEntry<? extends K, ? extends V>> entries) {\n        try (WriteBatch batch = new WriteBatch();\n             WriteOptions writeOpts = new WriteOptions()) {\n            for (MarshalledEntry entry : entries) {\n                batch.put(marshaller.objectToByteBuffer(entry.getKey()), entry.getValueBytes().getBuf());\n            }\n            db.write(writeOpts, batch);\n        }\n    }\n}",
+      "language": "java"
+    },
+    {
+      "title": "2. High-Performance RocksDB Store Configuration",
+      "description": "Designed custom store configuration builders controlling RocksDB block sizes, snappy compression, and memory allocations directly from externalized configuration properties.",
+      "code": "@ConfigurationFor(RocksDbStoreV2.class)\n@BuiltBy(RocksDbStoreConfigurationBuilderV2.class)\n@SerializedWith(RocksDbStoreConfigurationSerializerV2.class)\npublic class RocksDbStoreConfigurationV2 extends AbstractStoreConfiguration {\n    final static AttributeDefinition<CompressionType> COMPRESSION_TYPE =\n        AttributeDefinition.builder(\"compression-type\", CompressionType.SNAPPY)\n            .immutable()\n            .autoPersist(false)\n            .build();\n\n    final static AttributeDefinition<Integer> BLOCK_SIZE =\n        AttributeDefinition.builder(\"block-size\", 4096)\n            .immutable()\n            .build();\n}",
+      "language": "java"
+    },
+    {
+      "title": "3. Lucene NRT Indexing & Worker Tuning",
+      "description": "Configured near-real-time (NRT) Lucene index managers with synchronous worker execution to guarantee immediate query visibility following commit operations.",
+      "code": "indexingBuilder\n    .addProperty(\"lucene_version\", \"LUCENE_CURRENT\")\n    .addProperty(\"default.indexBase\", DeploymentPath.getIndexDir(false) + File.separator + name)\n    .addProperty(\"default.directory_provider\", FSExtDirectoryProvider.class.getName())\n    .addProperty(\"default.indexmanager\", NRTExtIndexManager.class.getName())\n    .addProperty(\"default.indexwriter.index_flush_interval\", String.valueOf(baseConfig.getInt(\"index.flush.interval\")))\n    .addProperty(\"default.indexwriter.ram_buffer_size\",\n        String.valueOf(Math.max(1, configValue.getLong(\"storage.indexBufferSize\") / (1024 * 1024))))\n    .addProperty(\"default.worker.execution\", \"sync\")\n    .addProperty(\"default.reader.strategy\", \"shared\");",
+      "language": "java"
+    },
+    {
+      "title": "4. Memory Management & Transaction Semantics",
+      "description": "Bound the cache template to binary storage types with repeatable read isolation and optimistic transactional locking.",
+      "code": "Configuration template = indexingBuilder\n    .memory()\n    .storageType(StorageType.BINARY)\n    .evictionType(EvictionType.valueOf(configValue.getString(\"eviction.type\")))\n    .evictionStrategy(EvictionStrategy.REMOVE)\n    .size(configValue.getLong(\"eviction.size\"))\n    .locking()\n    .isolationLevel(IsolationLevel.REPEATABLE_READ)\n    .transaction()\n    .lockingMode(LockingMode.OPTIMISTIC)\n    .transactionMode(TransactionMode.TRANSACTIONAL)\n    .build();\n\ncacheMgr.defineConfiguration(name, template);\nCache<K, V> cache = cacheMgr.getCache(name);",
+      "language": "java"
+    }
+  ],
+  "impact": [
+    "Delivered microsecond-range key lookups from memory with zero data loss on node restart via RocksDB SSD backing.",
+    "Eliminated network round trips for full-text searches by hosting inverted Lucene indices locally within the same JVM heap and filesystem.",
+    "Guaranteed strict ACID transaction boundaries across data storage and indexing via synchronized write hooks."
+  ],
+  "lessons": [
+    "Synchronous Lucene indexing ensures instant read-your-own-writes consistency, but requires diligent RAM buffer size tuning to prevent garbage collection pauses during high write bursts.",
+    "Carefully isolate RocksDB native memory limits (off-heap) from JVM heap allocations to avoid container OOM-kills."
+  ]
+}

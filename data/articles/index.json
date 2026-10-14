@@ -1,0 +1,24 @@
+{
+  "articles": [
+    "006-couchbase-dcp-change-data-capture.json",
+    "005-async-session-generation-concurrency.json",
+    "004-kubernetes-couchbase-helm-architecture.json",
+    "016-snappydata-spark-to-amazon-redshift-serverless-migration.json",
+    "009-healthcare-data-pipeline-bigquery-metabase.json",
+    "003-couchbase-migration-adapter-pattern.json",
+    "017-graphql-selective-binary-deserialization-amazon-ion.json",
+    "015-migrating-infinispan-to-mongodb-atlas-adapter-pattern.json",
+    "012-building-delta-lake-azure-synapse-analytics.json",
+    "018-building-rest-apis-django-rest-framework-python.json",
+    "014-querying-infinispan-hibernate-search-lucene.json",
+    "013-infinispan-rocksdb-lucene-embedded-architecture.json",
+    "001-terraform-multi-region-healthcare-azure.json",
+    "019-aws-certified-solutions-architect-professional.json",
+    "020-scaling-spring-boot-ec2-autoscaling-aurora-jenkins.json",
+    "011-hl7-fhir-r4-dynamic-keybox-extensions.json",
+    "008-pharmacy-supply-chain-inventory-state-machine.json",
+    "010-embedded-rocksdb-multi-column-families.json",
+    "007-hospital-double-entry-accounting-billing.json",
+    "002-ansible-zero-downtime-server-setup-tuning.json"
+  ]
+}

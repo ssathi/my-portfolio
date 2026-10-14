@@ -1,0 +1,62 @@
+{
+  "slug": "hospital-double-entry-accounting-billing",
+  "title": "Engineering a Double-Entry Accounting & Multi-Payer Invoicing Engine",
+  "subtitle": "Modeling auditable general ledgers, insurance copayment splits, and dynamic charging rules for high-volume hospital operations.",
+  "category": "FinTech & Billing",
+  "date": "2019",
+  "readTime": "16 min read",
+  "tags": [
+    "FinTech",
+    "Double-Entry Bookkeeping",
+    "InvoiceService",
+    "Hospital Billing",
+    "Auditing",
+    "Java"
+  ],
+  "metrics": [
+    {
+      "label": "Reconciliation Error",
+      "value": "$0.00"
+    },
+    {
+      "label": "Invoices Processed",
+      "value": "Millions"
+    },
+    {
+      "label": "Payer Split Types",
+      "value": "Copay / Insurance / Govt"
+    },
+    {
+      "label": "Commits on Core Services",
+      "value": "370+"
+    }
+  ],
+  "overview": "Healthcare billing is among the most intricate financial domains in software engineering. Unlike standard e-commerce carts with simple credit card charges, a single hospital admission invoice involves doctor professional fees, hospital ward bed charges, surgical consumable line items, pharmacy medications, tiered insurance copays, corporate guarantee letters, and government welfare subsidies. Over 7+ years and 370+ dedicated financial commits, I designed and built Arogya's financial backbone: an auditable, double-entry general ledger, dynamic charging rules engine, and multi-payer invoice resolution system.",
+  "problem": "Healthcare financial transactions require zero tolerance for mathematical rounding errors or un-audited state changes:\n1. **Multi-Payer Cost Splitting:** A $5,000 orthopedic surgery bill might be split: $3,500 covered by private health insurance, $1,000 by employer corporate guarantee, and $500 paid in cash by the patient upon discharge.\n2. **Auditability & Regulatory Strictness:** Accounting standards demand balanced double-entry journals for every debit and credit. Invoices cannot simply have their numbers overwritten when a dispute occurs; offsetting credit notes and journal reversals are mandatory.\n3. **Dynamic Charging Rules:** Consultation fees differ based on doctor specialization, day of week, emergency triage level, and institutional discounts.",
+  "architecture": "The billing and accounting engine integrates transactional invoicing with strict general ledger accounting:\n```\nPatient Discharge / Service Dispensed\n                    │\n                    ▼\n┌────────────────────────────────────────────────────────┐\n│  InvoiceService (Transaction Coordinator)              │\n│  ├─ Resolves Charging Rules (Base fees, tiers, taxes)  │\n│  ├─ Computes Payer Distribution:                       │\n│  │  ├─ Patient Copay Balance                           │\n│  │  ├─ Insurance Scheme Deductible                     │\n│  │  └─ Corporate Credit Guarantee                      │\n│  └─ Validates line-item discount authorizations        │\n└───────────────────┬────────────────────────────────────┘\n                    │ Atomic Write\n                    ▼\n┌────────────────────────────────────────────────────────┐\n│  AccountJournalService (Double-Entry General Ledger)   │\n│  Creates balanced Journal Entries:                     │\n│  ├─ DEBIT: Accounts Receivable (Patient Copay)         │\n│  ├─ DEBIT: Accounts Receivable (Insurance Company)     │\n│  ├─ CREDIT: Hospital Revenue (Ward / Room Charges)     │\n│  ├─ CREDIT: Hospital Revenue (Pharmacy Dispensing)     │\n│  └─ CREDIT: Doctor Payable (Channelling Revenue-Share) │\n└───────────────────┬────────────────────────────────────┘\n                    │ Verification\n                    ▼\n┌────────────────────────────────────────────────────────┐\n│  LedgerAccountService & Receipt Integrity              │\n│  - Verifies SUM(Debits) == SUM(Credits)                │\n│  - Generates cryptographically verifiable receipt token│\n└────────────────────────────────────────────────────────┘\n```",
+  "implementation": [
+    {
+      "title": "1. Strict Double-Entry Journal Creation",
+      "description": "Enforces that every invoice transaction produces balanced debit and credit entries with explicit account codes before persisting.",
+      "code": "public AccountJournal createInvoiceJournal(Invoice invoice) {\n    AccountJournal journal = new AccountJournal();\n    journal.setReferenceNumber(invoice.getInvoiceNumber());\n    journal.setPostingDate(Instant.now());\n\n    BigDecimal totalDebit = BigDecimal.ZERO;\n    BigDecimal totalCredit = BigDecimal.ZERO;\n\n    for (JournalLineItem item : calculateJournalLines(invoice)) {\n        if (item.getDirection() == EntryDirection.DEBIT) {\n            totalDebit = totalDebit.add(item.getAmount());\n        } else {\n            totalCredit = totalCredit.add(item.getAmount());\n        }\n        journal.addLineItem(item);\n    }\n\n    // Mathematical zero-tolerance guarantee\n    if (totalDebit.compareTo(totalCredit) != 0) {\n        throw new UnbalancedJournalException(\"Debits (\" + totalDebit + \") != Credits (\" + totalCredit + \")\");\n    }\n\n    return journalRepo.save(journal);\n}",
+      "language": "java"
+    },
+    {
+      "title": "2. Multi-Payer Invoice Line-Item Resolution",
+      "description": "Splits line-item costs across insurance policies, corporate credit letters, and patient out-of-pocket liabilities.",
+      "code": "public InvoiceSettlement settleInvoice(Invoice invoice, PaymentDistribution distribution) {\n    BigDecimal remaining = invoice.getGrossAmount();\n\n    // 1. Deduct Corporate / Insurance Scheme\n    BigDecimal insurancePortion = distribution.getInsurancePolicy()\n        .calculateCoverage(invoice);\n    remaining = remaining.subtract(insurancePortion);\n\n    // 2. Apply Authorized Discounts\n    BigDecimal discountPortion = distribution.getAuthorizedDiscount();\n    remaining = remaining.subtract(discountPortion);\n\n    // 3. Assign Patient Copay Liability\n    BigDecimal patientCopay = remaining;\n\n    InvoiceSettlement settlement = new InvoiceSettlement(insurancePortion, discountPortion, patientCopay);\n    return settlement;\n}",
+      "language": "java"
+    }
+  ],
+  "impact": [
+    "Processed millions of hospital transactions across nationwide facilities with zero balance discrepancy across financial audits.",
+    "Automated complex insurance billing reconciliation, reducing end-of-month hospital accounts closing time by 75%.",
+    "Enabled real-time doctor fee revenue-share calculations upon invoice settlement, eliminating manual end-of-month doctor channelling payout reconciliations."
+  ],
+  "lessons": [
+    "Never store financial amounts in floating-point data types; always use high-precision BigDecimal with explicit rounding modes.",
+    "Hard-coding mathematical validation (Sum of Debits must equal Sum of Credits) at the core domain model layer prevents bugs from reaching accounting ledgers."
+  ],
+  "number": "007",
+  "id": 7
+}
